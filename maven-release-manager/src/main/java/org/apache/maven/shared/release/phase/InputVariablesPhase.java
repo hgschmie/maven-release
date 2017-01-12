@@ -29,9 +29,14 @@ import org.apache.maven.shared.release.ReleaseExecutionException;
 import org.apache.maven.shared.release.ReleaseResult;
 import org.apache.maven.shared.release.config.ReleaseDescriptor;
 import org.apache.maven.shared.release.env.ReleaseEnvironment;
+import org.apache.maven.shared.release.policy.PolicyException;
+import org.apache.maven.shared.release.policy.version.VersionPolicy;
+import org.apache.maven.shared.release.policy.version.VersionPolicyRequest;
+import org.apache.maven.shared.release.policy.version.VersionPolicyResult;
 import org.apache.maven.shared.release.scm.ReleaseScmRepositoryException;
 import org.apache.maven.shared.release.scm.ScmRepositoryConfigurator;
 import org.apache.maven.shared.release.util.ReleaseUtil;
+import org.apache.maven.shared.release.versions.VersionParseException;
 import org.codehaus.plexus.component.annotations.Requirement;
 import org.codehaus.plexus.components.interactivity.Prompter;
 import org.codehaus.plexus.components.interactivity.PrompterException;
@@ -44,6 +49,7 @@ import org.codehaus.plexus.interpolation.StringSearchInterpolator;
 import org.codehaus.plexus.util.StringUtils;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 
 /**
@@ -64,6 +70,11 @@ public class InputVariablesPhase
      * Whether this is a branch or a tag operation.
      */
     private boolean branchOperation;
+
+    /**
+     * Component used for custom or default version policy
+     */
+    private Map<String, VersionPolicy> versionPolicies;
 
     /**
      * Tool that gets a configured SCM repository from release configuration.
@@ -114,82 +125,108 @@ public class InputVariablesPhase
 
         String tag = releaseDescriptor.getScmReleaseLabel();
 
-        if ( tag == null )
+        // Must get default version from mapped versions, as the project will be the incorrect snapshot
+        String key = ArtifactUtils.versionlessKey( project.getGroupId(), project.getArtifactId() );
+        String releaseVersion = (String) releaseDescriptor.getReleaseVersions().get( key );
+
+        if ( releaseVersion == null )
         {
-            // Must get default version from mapped versions, as the project will be the incorrect snapshot
-            String key = ArtifactUtils.versionlessKey( project.getGroupId(), project.getArtifactId() );
-            String releaseVersion = (String) releaseDescriptor.getReleaseVersions().get( key );
-            if ( releaseVersion == null )
-            {
-                throw new ReleaseExecutionException( "Project tag cannot be selected if version is not yet mapped" );
-            }
+            throw new ReleaseExecutionException( "Project tag cannot be selected if version is not yet mapped" );
+        }
 
-            String defaultTag;
-            String scmTagNameFormat = releaseDescriptor.getScmTagNameFormat();
-            if ( scmTagNameFormat != null )
-            {
-                Interpolator interpolator = new StringSearchInterpolator( "@{", "}" );
-                List<String> possiblePrefixes = java.util.Arrays.asList( "project", "pom" );
-                Properties values = new Properties();
-                values.setProperty( "artifactId", project.getArtifactId() );
-                values.setProperty( "groupId", project.getGroupId() );
-                values.setProperty( "version", releaseVersion );
-                interpolator.addValueSource( new PrefixedPropertiesValueSource( possiblePrefixes, values, true ) );
-                RecursionInterceptor recursionInterceptor = new PrefixAwareRecursionInterceptor( possiblePrefixes );
-                try
-                {
-                    defaultTag = interpolator.interpolate( scmTagNameFormat, recursionInterceptor );
-                }
-                catch ( InterpolationException e )
-                {
-                    throw new ReleaseExecutionException(
-                        "Could not interpolate specified tag name format: " + scmTagNameFormat, e );
-                }
-            }
-            else
-            {
-                defaultTag = project.getArtifactId() + "-" + releaseVersion;
-            }
+        String scmTagNameFormat = releaseDescriptor.getScmTagNameFormat();
+        String defaultTag;
 
-            ScmProvider provider = null;
+        if ( scmTagNameFormat != null )
+        {
+            Interpolator interpolator = new StringSearchInterpolator( "@{", "}" );
+            List<String> possiblePrefixes = java.util.Arrays.asList( "project", "pom" );
+            Properties values = new Properties();
+            values.setProperty( "artifactId", project.getArtifactId() );
+            values.setProperty( "groupId", project.getGroupId() );
+            values.setProperty( "version", releaseVersion );
+            interpolator.addValueSource( new PrefixedPropertiesValueSource( possiblePrefixes, values, true ) );
+            RecursionInterceptor recursionInterceptor = new PrefixAwareRecursionInterceptor( possiblePrefixes );
             try
             {
-                provider = getScmProvider( releaseDescriptor, releaseEnvironment );
+                defaultTag = interpolator.interpolate( scmTagNameFormat, recursionInterceptor );
             }
-            catch ( ReleaseScmRepositoryException e )
+            catch ( InterpolationException e )
             {
                 throw new ReleaseExecutionException(
-                    "No scm provider can be found for url: " + releaseDescriptor.getScmSourceUrl(), e );
+                    "Could not interpolate specified tag name format: " + scmTagNameFormat, e );
             }
+        }
+        else
+        {
+            defaultTag = project.getArtifactId() + "-" + releaseVersion;
+        }
 
-            defaultTag = provider.sanitizeTagName( defaultTag );
+        ScmProvider provider = null;
+        try
+        {
+            provider = getScmProvider( releaseDescriptor, releaseEnvironment );
+        }
+        catch ( ReleaseScmRepositoryException e )
+        {
+            throw new ReleaseExecutionException(
+                "No scm provider can be found for url: " + releaseDescriptor.getScmSourceUrl(), e );
+        }
 
-            if ( releaseDescriptor.isInteractive() )
+        defaultTag = provider.sanitizeTagName( defaultTag );
+
+        String policyTag = null;
+
+        try
+        {
+            policyTag = resolveTagOrBranchVersion( tag, releaseVersion, releaseDescriptor.getProjectVersionPolicyId() );
+        }
+        catch ( VersionParseException e )
+        {
+            if ( !releaseDescriptor.isInteractive() )
             {
-                try
+                throw new ReleaseExecutionException( "Error parsing version: " + e.getMessage(), e );
+            }
+        }
+        catch ( PolicyException e )
+        {
+            throw new ReleaseExecutionException( e.getMessage(), e );
+        }
+
+        tag = StringUtils.isEmpty( policyTag ) ? tag : policyTag;
+
+        if ( releaseDescriptor.isInteractive() )
+        {
+            String interactiveTag = null;
+            try
+            {
+                if ( branchOperation )
                 {
-                    if ( branchOperation )
-                    {
-                        tag = prompter.prompt( "What is the branch name for \"" + project.getName() + "\"? ("
+                    interactiveTag = prompter.prompt( "What is the branch name for \"" + project.getName() + "\"? ("
                             + project.getGroupId() + ":" + project.getArtifactId() + ")" );
-                        if ( StringUtils.isEmpty( tag ) )
-                        {
-                            throw new ReleaseExecutionException( "No branch name was given." );
-                        }
-                    }
-                    else
+
+                    if ( StringUtils.isEmpty( interactiveTag ) )
                     {
-                        tag = prompter.prompt( "What is the SCM release tag or label for \"" + project.getName()
-                            + "\"? (" + project.getGroupId() + ":" + project.getArtifactId() + ")", defaultTag );
+                        throw new ReleaseExecutionException( "No branch name was given." );
                     }
                 }
-                catch ( PrompterException e )
+                else
                 {
-                    throw new ReleaseExecutionException( "Error reading version from input handler: " + e.getMessage(),
-                                                         e );
+                    interactiveTag = prompter.prompt( "What is the SCM release tag or label for \"" + project.getName()
+                            + "\"? (" + project.getGroupId() + ":" + project.getArtifactId() + ")", defaultTag );
                 }
             }
-            else if ( branchOperation )
+            catch ( PrompterException e )
+            {
+                throw new ReleaseExecutionException( "Error reading version from input handler: " + e.getMessage(), e );
+            }
+
+            tag = StringUtils.isEmpty( interactiveTag ) ? tag : interactiveTag;
+        }
+
+        if ( tag == null )
+        {
+            if ( branchOperation )
             {
                 throw new ReleaseExecutionException( "No branch name was given." );
             }
@@ -197,12 +234,37 @@ public class InputVariablesPhase
             {
                 tag = defaultTag;
             }
-            releaseDescriptor.setScmReleaseLabel( tag );
         }
+
+        releaseDescriptor.setScmReleaseLabel( tag );
 
         result.setResultCode( ReleaseResult.SUCCESS );
 
         return result;
+    }
+
+    private String resolveTagOrBranchVersion( String defaultTag, String projectVersion, String policyId )
+        throws PolicyException, VersionParseException
+    {
+        VersionPolicy policy = versionPolicies.get( policyId );
+        if ( policy == null )
+        {
+            throw new PolicyException( "Policy '" + policyId + "' is unknown, available: " + versionPolicies.keySet() );
+        }
+
+        VersionPolicyRequest request = new VersionPolicyRequest()
+            .setVersion( projectVersion )
+            .setProposal( defaultTag );
+
+        VersionPolicyResult result = policy.getBranchOrTagVersion( request );
+        if ( result == null || result.getVersion() == null )
+        {
+            return defaultTag;
+        }
+        else
+        {
+            return result.getVersion();
+        }
     }
 
     public ReleaseResult simulate( ReleaseDescriptor releaseDescriptor, ReleaseEnvironment releaseEnvironment,
